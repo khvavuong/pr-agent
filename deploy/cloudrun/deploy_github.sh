@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two-step deploy script (Docker image artifact flow)
-#
-# Step 1 (local): build image + export image artifact (.tar.gz)
-#   ./deploy/cloudrun/deploy_github.sh package
-#
-# Step 2 (on VM): load image from artifact + run service
-#   OPENAI_KEY=... GITHUB_APP_ID=... GITHUB_PRIVATE_KEY=... GITHUB_WEBHOOK_SECRET=... ./deploy_github.sh run
+# Two-step deploy script (image bundle + GCP Secret Manager flow)
+# 1) package: build Docker image and create one versioned tar.gz bundle (image only)
+# 2) run: on VM, load image and read runtime secrets from GCP Secret Manager
 
 MODE="${1:-}"
 if [[ -z "${MODE}" ]]; then
@@ -27,10 +23,15 @@ VERSION="${VERSION:-$(date +%Y%m%d-%H%M%S)}"
 IMAGE_NAME="${IMAGE_NAME:-pr-agent-github}"
 IMAGE_TAG="${IMAGE_TAG:-${VERSION}}"
 IMAGE_REF="${IMAGE_REF:-${IMAGE_NAME}:${IMAGE_TAG}}"
-IMAGE_ARTIFACT_NAME="${IMAGE_ARTIFACT_NAME:-${IMAGE_NAME}-${IMAGE_TAG}.tar.gz}"
-IMAGE_ARTIFACT_PATH="${PACKAGE_DIR}/${IMAGE_ARTIFACT_NAME}"
+BUNDLE_NAME="${BUNDLE_NAME:-${IMAGE_NAME}-${IMAGE_TAG}.tar.gz}"
+BUNDLE_PATH="${PACKAGE_DIR}/${BUNDLE_NAME}"
 CONTAINER_NAME="${CONTAINER_NAME:-pr-agent-github}"
 HOST_PORT="${HOST_PORT:-3000}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-}}"
+OPENAI_KEY_SECRET="${OPENAI_KEY_SECRET:-pr-agent-openai-key}"
+GITHUB_APP_ID_SECRET="${GITHUB_APP_ID_SECRET:-pr-agent-github-app-id}"
+GITHUB_PRIVATE_KEY_SECRET="${GITHUB_PRIVATE_KEY_SECRET:-pr-agent-github-private-key}"
+GITHUB_WEBHOOK_SECRET_SECRET="${GITHUB_WEBHOOK_SECRET_SECRET:-pr-agent-github-webhook-secret}"
 
 require_env() {
   local key="$1"
@@ -42,38 +43,78 @@ require_env() {
 
 do_package() {
   command -v docker >/dev/null 2>&1 || { echo "Missing command: docker"; exit 1; }
-  mkdir -p "${PACKAGE_DIR}"
+  command -v tar >/dev/null 2>&1 || { echo "Missing command: tar"; exit 1; }
+  command -v mktemp >/dev/null 2>&1 || { echo "Missing command: mktemp"; exit 1; }
 
-  echo "[1/3] Building Docker image: ${IMAGE_REF}"
+  mkdir -p "${PACKAGE_DIR}"
+  local tmp_dir image_tar metadata_env
+  tmp_dir="$(mktemp -d)"
+  image_tar="${tmp_dir}/image.tar"
+  metadata_env="${tmp_dir}/metadata.env"
+  trap 'rm -rf "${tmp_dir}"' EXIT
+
+  echo "[1/4] Building Docker image: ${IMAGE_REF}"
   docker build -f docker/Dockerfile.github -t "${IMAGE_REF}" .
 
-  echo "[2/3] Saving image artifact: ${IMAGE_ARTIFACT_PATH}"
-  docker save "${IMAGE_REF}" | gzip > "${IMAGE_ARTIFACT_PATH}"
+  echo "[2/4] Exporting image"
+  docker save -o "${image_tar}" "${IMAGE_REF}"
 
-  echo "[3/3] Done"
-  echo "Artifact ready: ${IMAGE_ARTIFACT_PATH}"
-  echo "Copy this file + deploy_github.sh to VM, then run deploy_github.sh run with env vars."
+  echo "[3/4] Creating image metadata"
+  cat > "${metadata_env}" <<METADATA_ENV
+IMAGE_REF=${IMAGE_REF}
+CONTAINER_NAME=${CONTAINER_NAME}
+HOST_PORT=${HOST_PORT}
+METADATA_ENV
+
+  echo "[4/4] Writing bundle: ${BUNDLE_PATH}"
+  tar -czf "${BUNDLE_PATH}" -C "${tmp_dir}" image.tar metadata.env
+
+  echo "Done"
+  echo "Bundle ready: ${BUNDLE_PATH}"
+  echo "Copy this bundle + deploy_github.sh to VM, then run: bash deploy_github.sh run"
 }
 
 do_run() {
   command -v sudo >/dev/null 2>&1 || { echo "Missing command: sudo"; exit 1; }
+  command -v tar >/dev/null 2>&1 || { echo "Missing command: tar"; exit 1; }
+  command -v gcloud >/dev/null 2>&1 || { echo "Missing command: gcloud"; exit 1; }
 
-  require_env OPENAI_KEY
-  require_env GITHUB_APP_ID
-  require_env GITHUB_PRIVATE_KEY
-  require_env GITHUB_WEBHOOK_SECRET
+  require_env GCP_PROJECT_ID
 
-  local artifact_path
-  artifact_path="${IMAGE_ARTIFACT_PATH}"
-  if [[ ! -f "${artifact_path}" ]] && [[ -f "${IMAGE_ARTIFACT_NAME}" ]]; then
-    artifact_path="${IMAGE_ARTIFACT_NAME}"
+  local bundle_path tmp_dir image_tar metadata_env
+  bundle_path="${BUNDLE_PATH}"
+  if [[ ! -f "${bundle_path}" ]] && [[ -f "${BUNDLE_NAME}" ]]; then
+    bundle_path="${BUNDLE_NAME}"
   fi
-  if [[ ! -f "${artifact_path}" ]]; then
-    echo "Image artifact not found: ${IMAGE_ARTIFACT_PATH} (or ${IMAGE_ARTIFACT_NAME})"
+  if [[ ! -f "${bundle_path}" ]]; then
+    echo "Bundle not found: ${BUNDLE_PATH} (or ${BUNDLE_NAME})"
     exit 1
   fi
 
-  echo "[1/5] Ensuring Docker exists"
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "${tmp_dir}"' EXIT
+  tar -xzf "${bundle_path}" -C "${tmp_dir}"
+
+  image_tar="${tmp_dir}/image.tar"
+  metadata_env="${tmp_dir}/metadata.env"
+  [[ -f "${image_tar}" ]] || { echo "Invalid bundle: missing image.tar"; exit 1; }
+  [[ -f "${metadata_env}" ]] || { echo "Invalid bundle: missing metadata.env"; exit 1; }
+
+  set -a
+  # shellcheck disable=SC1090
+  source "${metadata_env}"
+  set +a
+
+  require_env IMAGE_REF
+
+  echo "[1/6] Reading secrets from GCP Secret Manager"
+  local openai_key github_app_id github_private_key github_webhook_secret
+  openai_key="$(gcloud secrets versions access latest --project "${GCP_PROJECT_ID}" --secret "${OPENAI_KEY_SECRET}")"
+  github_app_id="$(gcloud secrets versions access latest --project "${GCP_PROJECT_ID}" --secret "${GITHUB_APP_ID_SECRET}")"
+  github_private_key="$(gcloud secrets versions access latest --project "${GCP_PROJECT_ID}" --secret "${GITHUB_PRIVATE_KEY_SECRET}")"
+  github_webhook_secret="$(gcloud secrets versions access latest --project "${GCP_PROJECT_ID}" --secret "${GITHUB_WEBHOOK_SECRET_SECRET}")"
+
+  echo "[2/6] Ensuring Docker exists"
   if ! command -v docker >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y docker.io
@@ -81,10 +122,10 @@ do_run() {
     sudo systemctl start docker
   fi
 
-  echo "[2/5] Loading Docker image from artifact"
-  sudo docker load -i "${artifact_path}"
+  echo "[3/6] Loading Docker image"
+  sudo docker load -i "${image_tar}"
 
-  echo "[3/5] Recreating container"
+  echo "[4/6] Recreating container"
   if sudo docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
     sudo docker rm -f "${CONTAINER_NAME}"
   fi
@@ -95,28 +136,24 @@ do_run() {
     -p "${HOST_PORT}:3000" \
     -e CONFIG__GIT_PROVIDER=github \
     -e GITHUB__DEPLOYMENT_TYPE=app \
-    -e GITHUB__APP_ID="${GITHUB_APP_ID}" \
-    -e GITHUB__PRIVATE_KEY="${GITHUB_PRIVATE_KEY}" \
-    -e GITHUB__WEBHOOK_SECRET="${GITHUB_WEBHOOK_SECRET}" \
-    -e OPENAI__KEY="${OPENAI_KEY}" \
+    -e GITHUB__APP_ID="${github_app_id}" \
+    -e GITHUB__PRIVATE_KEY="${github_private_key}" \
+    -e GITHUB__WEBHOOK_SECRET="${github_webhook_secret}" \
+    -e OPENAI__KEY="${openai_key}" \
     -e CONFIG__MODEL="gpt-5.3-codex" \
     -e CONFIG__FALLBACK_MODELS='["gpt-5.2-codex"]' \
     "${IMAGE_REF}"
 
-  echo "[4/5] Container status"
+  echo "[5/6] Container status"
   sudo docker ps --filter "name=${CONTAINER_NAME}"
 
-  echo "[5/5] Done"
+  echo "[6/6] Done"
   echo "Webhook endpoint: https://<YOUR_DOMAIN_OR_VM_IP>/api/v1/github_webhooks"
 }
 
 case "${MODE}" in
-  package)
-    do_package
-    ;;
-  run)
-    do_run
-    ;;
+  package) do_package ;;
+  run) do_run ;;
   *)
     echo "Unknown mode: ${MODE}"
     echo "Usage: $0 <package|run>"
