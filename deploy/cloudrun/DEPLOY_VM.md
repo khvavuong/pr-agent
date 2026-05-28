@@ -64,7 +64,7 @@ pr-agent-openai-key             2026-05-27T19:01:05  automatic           -
 Vẫn trên máy local, lấy service account của VM:
 
 ```bash
-export PROJECT_ID=<PROJECT_ID>
+export PROJECT_ID=project-1d9ef75c-8b9c-44bc-96e
 export VM_NAME=pr-agent
 export VM_ZONE=us-central1-a
 
@@ -96,6 +96,7 @@ gcloud secrets versions access latest \
 
 ```bash
 cd /home/khvavuong/Documents/Langgraph/pr-agent/pr-agent
+
 ./deploy/cloudrun/deploy_github.sh package
 ```
 
@@ -156,22 +157,32 @@ Cài GitHub App vào repo cần dùng, ví dụ `khvavuong/pr-test`.
 ```bash
 sudo docker ps
 sudo docker logs -f pr-agent-github
-curl -i http://127.0.0.1:3000/
+sudo docker logs -f pr-agent-github-nginx
+curl -i http://127.0.0.1/api/v1/github_webhooks
 ```
 
-## 8) Firewall và HTTPS
+## 8) Reverse proxy bằng Nginx container
 
-Nếu expose trực tiếp port 3000:
+Kiểm tra sau deploy:
 
 ```bash
-gcloud compute firewall-rules create allow-pr-agent-3000 \
-  --allow tcp:3000 \
+# VM external IP
+curl -s ifconfig.me
+
+# App + proxy container
+sudo docker ps
+
+# HTTP test qua Nginx container
+curl -i http://35.254.154.47/api/v1/github_webhooks
+```
+
+## 9) Firewall và HTTPS
+
+Mở firewall port `80` cho Nginx container nếu chưa mở:
+
+```bash
+gcloud compute firewall-rules create allow-pr-agent-http \
+  --allow tcp:80 \
   --target-tags <VM_NETWORK_TAG> \
   --project "$PROJECT_ID"
-```
-
-Khuyến nghị production: dùng Nginx hoặc Caddy cho HTTPS, proxy vào `127.0.0.1:3000`.
-
-```
-
 ```
