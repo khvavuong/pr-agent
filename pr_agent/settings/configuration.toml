@@ -254,6 +254,7 @@ push_trigger_pending_tasks_ttl = 300
 push_commands = [
     "/describe",
     "/review",
+    "/improve",
 ]
 
 [gitlab]
@@ -268,6 +269,7 @@ handle_push_trigger = false
 push_commands = [
     "/describe",
     "/review",
+    "/improve",
 ]
 # Configure SSL validation for GitLab. Can be either set to the path of a custom CA or disabled entirely.
 # ssl_verify = true
@@ -283,6 +285,7 @@ pr_commands = [
 push_commands = [
     "/describe",
     "/review",
+    "/improve",
 ]
 
 [bitbucket_app]
